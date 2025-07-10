@@ -1,0 +1,105 @@
+// ==UserScript==
+// @name         Kleinanzeigen €/m² Premium UI Analyzer v21.5.3
+// @namespace    http://tampermonkey.net/
+// @version      21.5.3
+// @description  Berechnet €/m² für Kleinanzeigen mit Premium UI und Multi-Filter (v21.5.3)
+// @author       Moritz Baumeister
+// @match        https://www.kleinanzeigen.de/s-wohnung-mieten*/*
+// @grant        GM_addStyle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    /* === Konfiguration === */
+    const MIN_REALISTIC_PRICE = 5;
+    const MAX_REALISTIC_PRICE = 35;
+    const OUTLIER_THRESHOLD_LOW = 0.3;
+    const OUTLIER_THRESHOLD_HIGH = 2.5;
+
+    /* === Lokale DB für €/m²-Werte === */
+    let globalSqmPricesByRegion = JSON.parse(localStorage.getItem('kleinanzeigen_sqm_prices')||'{}');
+
+    /* === Debounce Helfer === */
+    function debounce(fn,delay){let t; return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),delay)}}
+
+    /* === CSS Styles (Premium UI) === */
+    GM_addStyle(`
+        /* Dashboard */
+        .sqm-dashboard { margin: 12px 0; padding: 12px; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,0.1); border-radius:2px; font:14px/1.4 "Helvetica Neue",Arial,sans-serif; }
+        .sqm-dashboard-inner { padding:12px; background:#fff; border-radius:2px; }
+        .sqm-dashboard-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; }
+        .sqm-dashboard-title { display:flex; align-items:center; gap:12px; font-size:16px; font-weight:600; }
+        .sqm-dashboard-icon { width:48px; height:48px; background:#0054E0; border-radius:50%; color:#fff; display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:bold; }
+        .sqm-request-warning { background:#FFF3CD; border:1px solid #FFE69C; color:#856404; padding:8px 12px; border-radius:4px; margin-bottom:12px; font-size:13px; }
+        .sqm-stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:12px; margin-bottom:16px; }
+        .sqm-stat-item { padding:12px; border-left:3px solid #ddd; background:#f9f9f9; border-radius:0 4px 4px 0; transition:all .2s; }
+        .sqm-stat-item:hover{background:#f5f5f5;transform:translateX(2px)}
+        .sqm-stat-label{font-size:12px;color:#666;font-weight:500;margin-bottom:4px}
+        .sqm-stat-value{font-size:18px;font-weight:700;color:#0054E0;margin-bottom:4px}
+        .sqm-stat-details{font-size:11px;color:#666;margin-top:4px}
+        /* Filter Buttons */
+        #filter-button-container{display:flex;gap:12px;align-items:center;justify-content:center;margin:16px 0 0;padding-top:16px;border-top:1px solid rgba(0,0,0,0.08);flex-wrap:wrap}
+        .filter-btn{width:56px;height:56px;padding:10px;border-radius:12px;border:3px solid transparent;background:#fff;box-shadow:0 3px 6px rgba(0,0,0,0.15);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s}
+        .filter-btn:hover{transform:translateY(-3px);box-shadow:0 6px 12px rgba(0,0,0,0.25)}
+        .filter-btn.active{transform:translateY(-3px);box-shadow:0 6px 12px rgba(0,0,0,0.25);border-color:#0054E0}
+        .filter-btn svg{width:32px;height:32px;transition:transform .1s}
+        .filter-btn:hover svg{transform:scale(1.1)}
+        .custom-tooltip{position:fixed;background:rgba(0,0,0,0.9);color:#fff;padding:12px 16px;border-radius:8px;font-size:14px;font-weight:500;white-space:nowrap;z-index:10000;pointer-events:none;opacity:0;transform:translateY(5px);transition:all .2s;box-shadow:0 4px 12px rgba(0,0,0,0.3);border:1px solid rgba(255,255,255,0.1)}
+        .custom-tooltip::before{content:'';position:absolute;top:100%;left:50%;transform:translateX(-50%);border-left:8px solid transparent;border-right:8px solid transparent;border-top:8px solid rgba(0,0,0,0.9)}
+        .custom-tooltip.below::before{top:-8px;border-top:none;border-bottom:8px solid rgba(0,0,0,0.9)}
+        .custom-tooltip.show{opacity:1;transform:translateY(0)}
+        .sqm-price-low{border-left:4px solid rgba(76,175,80,0.8)!important;background:rgba(76,175,80,0.05)!important}
+        .sqm-price-medium{border-left:4px solid rgba(255,193,7,0.8)!important;background:rgba(255,193,7,0.05)!important}
+        .sqm-price-high{border-left:4px solid rgba(244,67,54,0.8)!important;background:rgba(244,67,54,0.05)!important}
+        .sqm-price-unrealistic{border-left:4px solid rgba(158,158,158,0.8)!important;background:rgba(158,158,158,0.05)!important;opacity:.7}
+        .sqm-price-display{font-weight:700;font-size:19.6px;color:#20242c;margin-left:10px;display:flex;align-items:center;gap:4px}
+        .sqm-price-container{margin-top:4px}
+        @media(max-width:768px){.sqm-stats-grid{grid-template-columns:1fr}#filter-button-container{justify-content:flex-start;overflow-x:auto;-webkit-overflow-scrolling:touch}.custom-tooltip{display:none}}
+    `);
+
+    /* === Utils === */
+    function logDebug(...args){console.log('[Kleinanzeigen €/m²]',...args)}
+    function saveDB(){localStorage.setItem('kleinanzeigen_sqm_prices',JSON.stringify(globalSqmPricesByRegion))}
+    function calculateMedian(arr){const s=arr.slice().sort((a,b)=>a-b),m=Math.floor(s.length/2);return s.length%2? s[m]:(s[m-1]+s[m])/2}
+
+    /* === Parsing === */
+    function detectRequestType(article){ const txt=article.textContent.toLowerCase();return /suche|gesuch/.test(txt)?'request':'offer'}
+    function toISO(text){ const now=new Date(),h=text.match(/Heute,\s*(\d{1,2}:\d{2})/)?.[1]; if(h){const [H,M]=h.split(':').map(Number);now.setHours(H,M,0,0);return now.toISOString()} const p=Date.parse(text);return isNaN(p)?new Date().toISOString():new Date(p).toISOString() }
+    function parseAd(article){ article.querySelector('.galleryimage--counter')?.remove(); const id=article.dataset.adid||'',t=article.querySelector('h2 a')?.textContent.trim()||'',pTxt=article.querySelector('.aditem-main--middle--price-shipping--price')?.textContent||'',aTxt=article.querySelector('.text-module-end .simpletag:nth-of-type(1)')?.textContent||'',dTxt=article.querySelector('.aditem-main--top--right')?.textContent||'',price=+pTxt.replace(/\D/g,''),area=+aTxt.replace(/\D/g,''),perSqm=area?price/area:null;return{id,t,price,area,date:toISO(dTxt),perSqm}}    
+
+    /* === Extraction === */
+    function extractData(){ const sel=['article.aditem','.ad-listitem article'],arts=sel.reduce((res,s)=>res.length?res:Array.from(document.querySelectorAll(s)),[]),items=[];arts.forEach((art,i)=>{try{ const type=detectRequestType(art); const d=parseAd(art); if(!d.perSqm)return; const plz=art.querySelector('.aditem-main--top--left')?.textContent.trim().split(' ')[0]||'00000',region=plz.slice(0,2); items.push({art,d,region,type});}catch(e){logDebug('ParseErr',e)}});logDebug('Extracted',items.length);return items}
+
+    /* === Display €/m² === */
+    function addSqmDisplay(article,val){ let c=article.querySelector('.sqm-price-container'); if(!c){ const sec=article.querySelector('.aditem-main--middle--price-shipping');if(sec){c=document.createElement('div');c.className='sqm-price-container';sec.appendChild(c)} } c&&(c.innerHTML=`<span class="sqm-price-display">${val.toFixed(2)} €/m²</span>`)}
+
+    /* === Filter buttons & tooltips === */
+    const activeFilters=new Set();
+    function createTooltip(el,text){let tt;const show=()=>{tt=document.createElement('div');tt.className='custom-tooltip';tt.textContent=text;document.body.append(tt);const r=el.getBoundingClientRect(),tr=tt.getBoundingClientRect();let l=r.left+(r.width-tr.width)/2,t=r.top-tr.height-12;if(l<10)l=10;if(l+tr.width>window.innerWidth-10)l=window.innerWidth-tr.width-10;if(t<10){t=r.bottom+12;tt.classList.add('below')}tt.style.left=l+'px';tt.style.top=t+'px';setTimeout(()=>tt.classList.add('show'),10)},hide=()=>{tt&&tt.remove();tt=null};el.addEventListener('mouseenter',show);el.addEventListener('mouseleave',hide);el.addEventListener('click',hide)}
+    function createFilterUI(){ const dashInner=document.querySelector('.sqm-dashboard-inner'); if(!dashInner)return; let ctr=document.getElementById('filter-button-container'); if(ctr)ctr.remove(); ctr=document.createElement('div');ctr.id='filter-button-container';dashInner.append(ctr);
+        const filters=[
+            {cls:'sqm-price-low',svg:`<svg>...LOW</svg>`,tip:'Günstige'},
+            {cls:'sqm-price-medium',svg:`<svg>...MED</svg>`,tip:'Durchschnitt'},
+            {cls:'sqm-price-high',svg:`<svg>...HIGH</svg>`,tip:'Teuer'},
+            {cls:'sqm-price-unrealistic',svg:`<svg>...UNR</svg>`,tip:'Unrealistisch'},
+            {cls:'reset',svg:`<svg>...RST</svg>`,tip:'Reset'}
+        ];filters.forEach(f=>{const btn=document.createElement('button');btn.className='filter-btn';btn.innerHTML=f.svg;createTooltip(btn,f.tip);if(f.cls==='reset'){btn.onclick=()=>{activeFilters.clear();document.querySelectorAll('.filter-btn.active').forEach(b=>b.classList.remove('active'));analyze()}}else btn.onclick=()=>{btn.classList.toggle('active');activeFilters.has(f.cls)?activeFilters.delete(f.cls):activeFilters.add(f.cls);applyFilters()};ctr.append(btn)})}
+
+    /* === Filtering articles by activeFilters === */
+    function applyFilters(){ document.querySelectorAll('article.aditem').forEach(art=>{ const show=!activeFilters.size||[...activeFilters].some(c=>art.classList.contains(c));art.closest('li.ad-listitem').style.display=show?'block':'none'}) }
+
+    /* === Dashboard build === */
+    function createOrUpdateDashboard(stats){ const hdr=document.querySelector('.srp-header.a-padded.l-container-row.contentbox.surface'); if(!hdr) return; document.querySelector('.sqm-dashboard')?.remove(); const dash=document.createElement('div');dash.className='sqm-dashboard'; let html=`<div class="sqm-dashboard-inner"><div class="sqm-dashboard-header"><div class="sqm-dashboard-title"><span class="sqm-dashboard-icon">€/m²</span><span>Immobilienmarkt-Analyse (${stats.totalOffers} Angebote${stats.hidden?`, ${stats.hidden} ausgeblendet`:''})</span></div></div>`; if(stats.requestFiltered) html+=`<div class="sqm-request-warning">⚠️ Gesuche ausgeblendet</div>`; html+=`<div class="sqm-stats-grid">`; stats.topRegions.forEach(r=>{html+=`<div class="sqm-stat-item" style="border-left-color:${r.color}"><div class="sqm-stat-label">PLZ ${r.region}xxx${r.top? ' (Häufigste)':''}</div><div class="sqm-stat-value">${r.median.toFixed(0)} €/m²</div><div class="sqm-stat-details">${r.count} Angebote • ${r.min.toFixed(0)}-${r.max.toFixed(0)} €/m²</div></div>`}); html+=`</div><div id="filter-button-container"></div></div>`; dash.innerHTML=html; hdr.insertAdjacentElement('afterend',dash); createFilterUI() }
+
+    /* === Core analyze === */
+    function analyze(){ logDebug('Start Analyse'); const items=extractData(); const offers=items.filter(i=>i.type==='offer'); offers.forEach(i=>{ globalSqmPricesByRegion[i.region]=globalSqmPricesByRegion[i.region]||{}; globalSqmPricesByRegion[i.region][i.d.id]=Math.round(i.d.perSqm*100)/100 }); saveDB(); const stats={}; let hidden=0; offers.forEach(i=>{ const arr=Object.values(globalSqmPricesByRegion[i.region]||[]).filter(p=>p>=MIN_REALISTIC_PRICE&&p<=MAX_REALISTIC_PRICE); const med=arr.length?calculateMedian(arr):0; const pr=i.d.perSqm; addSqmDisplay(i.art,pr); let cls=''; if(pr<MIN_REALISTIC_PRICE||pr>MAX_REALISTIC_PRICE||pr<med*OUTLIER_THRESHOLD_LOW||pr>med*OUTLIER_THRESHOLD_HIGH) cls='sqm-price-unrealistic'; else if(arr.length<2) cls='sqm-price-uniform'; else cls=pr<med*0.85?'sqm-price-low':pr<=med*1.15?'sqm-price-medium':'sqm-price-high'; i.art.classList.add(cls); stats[i.region]=stats[i.region]||{region:i.region,prices:[]}; stats[i.region].prices.push(pr)}); const totalOffers=offers.length; const hiddenCount=applyRequestFilter(offers); const sorted=Object.values(stats).map(s=>({region:s.region,median:calculateMedian(s.prices),count:s.prices.length,min:Math.min(...s.prices),max:Math.max(...s.prices)})).sort((a,b)=>b.count-a.count).slice(0,4); const topRegions=sorted.map((r,i)=>({...r,top:i===0,color:i===0?'#0054E0':'#ddd'})); createOrUpdateDashboard({ totalOffers, hidden:hiddenCount, requestFiltered:shouldFilterRequests(), topRegions }); }
+
+    function shouldFilterRequests(){return location.href.includes('anzeige:angebote')}
+    function applyRequestFilter(offers){ let h=0; if(shouldFilterRequests()){ offers.forEach(o=>{if(o.type==='request'){o.art.closest('li.ad-listitem')?.remove();h++}})} return h }
+
+    /* === Initialization & Observer === */
+    function init(){ logDebug('Init'); analyze(); new MutationObserver(debounce(analyze,500)).observe(document.body,{childList:true,subtree:true}); }
+    if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);else init();
+
+})();
